@@ -2,7 +2,7 @@
 // $Id: chess.php,v 1.15 2013/12/08 14:00:00 gitjake Exp $
 
 /*
-    This file is part of WebChess. http://webchess.sourceforge.net
+    This file is part of WebChess. https://github.com/thorium/webchess
 	Copyright 2010 Jonathan Evraire, Rodrigo Flores
 
     WebChess is free software: you can redistribute it and/or modify
@@ -19,13 +19,14 @@
     along with WebChess.  If not, see <http://www.gnu.org/licenses/>.
 */
 
-	session_start();
-
-	/* load settings */
+	/* load settings (also pulls in the security helpers) */
 	if (!isset($_CONFIG)) {
 		require 'config.php';
 		include_once 'lang.php';
 	}
+
+	/* start a hardened session */
+	secure_session_start();
 
 	/* define constants */
 	require 'chessconstants.php';
@@ -38,15 +39,19 @@
 	require 'move.php';
 	require 'undo.php';
 
-	/* allow WebChess to be run on PHP systems < 4.1.0, using old http vars */
-	fixOldPHPVersions();
-
 	/* check session status */
 	require 'sessioncheck.php';
 
 	/* check if loading game */
 	if (isset($_POST['gameID']))
-		$_SESSION['gameID'] = $_POST['gameID'];
+	{
+		if (!is_string($_POST['gameID']) || !ctype_digit($_POST['gameID']))
+		{
+			http_response_code(400);
+			die('Invalid game.');
+		}
+		$_SESSION['gameID'] = (int)$_POST['gameID'];
+	}
 
 	/* debug flag */
 	define ("DEBUG", 0);
@@ -54,15 +59,35 @@
 	/* connect to database */
 	require 'connectdb.php';
 
+	/* only players, or replay-all viewers of finished games, may open a game */
+	if (!isset($_SESSION['gameID']) || !canViewGame($_SESSION['gameID']))
+	{
+		http_response_code(403);
+		die('Not authorized for this game.');
+	}
+
 	/* get White's nick */
-	$tmpNick = mysql_query("SELECT nick FROM " . $CFG_TABLE[players] . ", " . $CFG_TABLE[games] . " WHERE playerID = whitePlayer AND gameID = " . $_SESSION['gameID']);
-	$whiteNick = mysql_result($tmpNick, 0);
+	$whiteNick = db_value("SELECT nick FROM " . $CFG_TABLE[players] . ", " . $CFG_TABLE[games] . " WHERE playerID = whitePlayer AND gameID = ?", [$_SESSION['gameID']]);
 
 	/* get Black's nick */
-	$tmpNick = mysql_query("SELECT nick FROM " . $CFG_TABLE[players] . ", " . $CFG_TABLE[games] . " WHERE playerID = blackPlayer AND gameID = " . $_SESSION['gameID']);
-	$blackNick = mysql_result($tmpNick, 0);
+	$blackNick = db_value("SELECT nick FROM " . $CFG_TABLE[players] . ", " . $CFG_TABLE[games] . " WHERE playerID = blackPlayer AND gameID = ?", [$_SESSION['gameID']]);
 
 	/* load game */
+	/* Any state-changing game action posted here must carry a valid CSRF token.
+	   Merely continuing/loading a game from the main menu posts only gameID
+	   (and sharePC), so that navigation is intentionally not challenged. */
+	$gameActionFields = ['fromRow', 'toRow', 'promotion', 'requestUndo', 'requestDraw', 'resign', 'undoResponse', 'drawResponse', 'isCheckMate'];
+	foreach ($gameActionFields as $gameActionField)
+	{
+		if (isset($_POST[$gameActionField]) && $_POST[$gameActionField] !== '')
+		{
+			csrf_check();
+			/* only a participant may move / undo / draw / resign in this game */
+			requirePlayerInGame($_SESSION['gameID']);
+			break;
+		}
+	}
+
 	$isInCheck = (isset($_POST['isInCheck']) && ($_POST['isInCheck'] == 'true'));
 	$isCheckMate = false;
 	$isPromoting = false;
@@ -76,12 +101,17 @@
 		doUndo();
 		saveGame();
 	}
-	elseif (!empty($_POST['promotion']) && isset($_POST['toRow']) && ('' !== $_POST['toRow']) && isset($_POST['toCol']) && ('' !== $_POST['toCol'])) 
+	elseif (!empty($_POST['promotion']) && isset($_POST['toRow']) && ('' !== $_POST['toRow']) && isset($_POST['toCol']) && ('' !== $_POST['toCol']))
 	{
-		savePromotion();
-		$board[$_POST['toRow']][$_POST['toCol']] = $_POST['promotion'] | ($board[$_POST['toRow']][$_POST['toCol']] & BLACK);
-		saveGame();
-	} 
+		/* validate the promotion on the server so a forged request cannot
+		   conjure an arbitrary piece (or a 2nd king) onto any square */
+		if (isValidPromotionServer($_POST['toRow'], $_POST['toCol'], $_POST['promotion']))
+		{
+			savePromotion();
+			$board[$_POST['toRow']][$_POST['toCol']] = ((int)$_POST['promotion']) | ($board[$_POST['toRow']][$_POST['toCol']] & BLACK);
+			saveGame();
+		}
+	}
 	elseif (
 		isset($_POST['fromRow']) && isset($_POST['fromCol']) && isset($_POST['toRow']) && isset($_POST['toCol'])
 		&& ('' !== $_POST['fromRow']) && ('' !== $_POST['fromCol']) && ('' !== $_POST['toRow']) && ('' !== $_POST['toCol'])
@@ -107,6 +137,28 @@
 				$tmpIsValid = false;
 		}
 
+		/* A king stepping two files is a castling attempt: validate it on the
+		   server so a forged request cannot corrupt the board (see move.php). */
+		if ($tmpIsValid
+			&& (($board[$_POST['fromRow']][$_POST['fromCol']] & COLOR_MASK) == KING)
+			&& ($_POST['fromRow'] == $_POST['toRow'])
+			&& (abs((int)$_POST['toCol'] - (int)$_POST['fromCol']) == 2))
+		{
+			if (!isValidCastlingServer($_POST['fromRow'], $_POST['fromCol'], $_POST['toRow'], $_POST['toCol']))
+				$tmpIsValid = false;
+		}
+
+		/* A pawn stepping diagonally onto an empty square is an en-passant claim;
+		   validate it server-side so a forged move cannot delete a pawn illegally. */
+		if ($tmpIsValid
+			&& (($board[$_POST['fromRow']][$_POST['fromCol']] & COLOR_MASK) == PAWN)
+			&& ($_POST['toCol'] != $_POST['fromCol'])
+			&& ($board[$_POST['toRow']][$_POST['toCol']] == 0))
+		{
+			if (!isValidEnPassantServer($_POST['fromRow'], $_POST['fromCol'], $_POST['toRow'], $_POST['toCol']))
+				$tmpIsValid = false;
+		}
+
 		if ($tmpIsValid)
 		{
 			saveHistory();
@@ -114,7 +166,7 @@
 			saveGame();
 		}
 	}
-	elseif($history[$numMoves]['curPiece'] == 'pawn' && $history[$numMoves]['promotedTo'] == null)
+	elseif($numMoves >= 0 && $history[$numMoves]['curPiece'] == 'pawn' && $history[$numMoves]['promotedTo'] == null)
 	{	// Incomplete promotion?
 		if($history[$numMoves]['toRow'] == 7 || $history[$numMoves]['toRow'] == 0)
 		{
@@ -122,7 +174,6 @@
 		}
 	}
 
-	mysql_close();
 ?>
 <!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN"
    "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
@@ -131,10 +182,13 @@
 <meta http-equiv="Content-Type" content="text/html; charset=UTF-8" />
 <meta http-equiv="pragma" content="no-cache" />
 <meta http-equiv="Page-Exit" content="blendTrans(Duration=0.18)">
+<meta name="viewport" content="width=device-width, initial-scale=1" />
 <link rel="stylesheet" href="chess.css" type="text/css" />
+<link rel="stylesheet" href="responsive.css" type="text/css" />
+<link rel="stylesheet" href="boardcolors.css" type="text/css" />
 <?php
-	echo("<link rel='stylesheet' href='images/");
-	echo($_SESSION['pref_theme'] . "/wctheme.css' type='text/css' />\n");
+	echo("<link id='themeCss' rel='stylesheet' href='images/");
+	echo(h($_SESSION['pref_theme']) . "/wctheme.css' type='text/css' />\n");
 
 	/* find out if it's the current player's turn */
 	if (( (($numMoves == -1) || (($numMoves % 2) == 1)) && ($playersColor == "white"))
@@ -157,6 +211,14 @@
 	writeJSboard();
 	/* if it's not the player's turn, enable auto-refresh */
 	$autoRefresh = !$isPlayersTurn && !isBoardDisabled() && !$_SESSION['isSharedPC'];
+	/* The opponent's pawn has reached the last row but the promotion piece is
+	   not chosen yet: the halfmove is already counted, so it looks like the
+	   player's turn, yet the board stays disabled until the opponent decides.
+	   Keep polling, otherwise this tab would never learn that the promotion
+	   was completed (and notify.js could never announce the move). */
+	if ($isPromoting && $isPlayersTurn && !$_SESSION['isSharedPC']
+			&& empty($isUndoRequested) && empty($isDrawRequested) && empty($isGameOver))
+		$autoRefresh = true;
 	echo('var autoreload = ');
 	if(!$autoRefresh)
 		echo('0');
@@ -168,12 +230,28 @@
 	writeJShistory();
 	drawboard();
 	echo 'var gameId = ' . $_SESSION['gameID'] . ";\n";
-	echo 'var players = "' . $whiteNick . ' - ' . $blackNick . "\";\n";
-	echo 'var playersColor = "' . $playersColor . "\";\n";
+	echo 'var players = "' . h($whiteNick) . ' - ' . h($blackNick) . "\";\n";
+	echo 'var playersColor = "' . h($playersColor) . "\";\n";
 	echo 'var isPromoting = "'.$isPromoting. "\";\n";
 	echo 'var isKingInCheck = "'.$isInCheck. "\";\n";
 	echo 'var isGameOver = "'.$isGameOver. "\";\n";
 	echo 'var historyLayout = "'.$_SESSION['pref_historylayout']. "\";\n";
+
+	/* desktop notifications when the opponent has moved (see javascript/notify.js).
+	   Pointless on a shared PC, where both players sit at the same screen. */
+	$notifyEnabled = !$_SESSION['isSharedPC'] && isPlayerInGame($_SESSION['gameID'], $_SESSION['playerID']);
+	if ($notifyEnabled)
+	{
+		$opponentNick = ($playersColor == "white") ? $blackNick : $whiteNick;
+		$notifyConfig = [
+			'title' => APP_NAME . gettext(' - Your Move'),
+			'body' => sprintf(gettext('%1$s has made a move in game #%2$d.'), $opponentNick, $_SESSION['gameID']),
+			'msgBlocked' => gettext('Notifications are blocked for this site in your browser settings.'),
+			'msgUnsupported' => gettext('Not available in this browser (notifications need HTTPS).'),
+		];
+		/* the JSON_HEX_* flags keep nicknames from breaking out of the script block */
+		echo 'var wcNotify = ' . json_encode($notifyConfig, JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT) . ";\n";
+	}
 ?>
 	// I18n Messages. The translation lang is set in I18N_LOCALE and requires you to have the matching webchess.mo 
 	var i18nMessages = {
@@ -207,6 +285,13 @@ if(!isBoardDisabled() || $_SESSION['isSharedPC'])
 <script type="text/javascript" src="javascript/squareclicked.js"></script>');
 ?>
 <script type="text/javascript" src="javascript/board.js"></script>
+<script type="text/javascript" src="javascript/dnd.js"></script>
+<script type="text/javascript" src="javascript/boardprefs.js"></script>
+<?php
+if($notifyEnabled)
+	echo('<script type="text/javascript" src="javascript/notify.js"></script>
+');
+?>
 </head>
 <body>
 <div id="wrapper">
@@ -216,6 +301,7 @@ if(!isBoardDisabled() || $_SESSION['isSharedPC'])
     <?php require 'info.php'; ?>
 	<div id="boardsection" align="center">
 		<form name="gamedata" method="post" action="chess.php">
+		<?php echo csrf_field(); ?>
 		<?php
 			if ($isPromoting && (!$isPlayersTurn || $_SESSION['isSharedPC'])) // Write promotion dialog only to the correct player
 				writePromotion();
@@ -237,26 +323,43 @@ if(!isBoardDisabled() || $_SESSION['isSharedPC'])
 		<input type="hidden" name="requestUndo" value="no" />
 		<input type="hidden" name="requestDraw" value="no" />
 		<input type="hidden" name="resign" value="no" />
-		<input type="hidden" name="fromRow" value="<?php if ($isPromoting) echo ($_POST['fromRow']); ?>" />
-		<input type="hidden" name="fromCol" value="<?php if ($isPromoting) echo ($_POST['fromCol']); ?>" />
-		<input type="hidden" name="toRow" value="<?php if ($isPromoting) echo ($_POST['toRow']); ?>" />
-		<input type="hidden" name="toCol" value="<?php if ($isPromoting) echo ($_POST['toCol']); ?>" />
+		<input type="hidden" name="fromRow" value="<?php if ($isPromoting) echo (h($_POST['fromRow'])); ?>" />
+		<input type="hidden" name="fromCol" value="<?php if ($isPromoting) echo (h($_POST['fromCol'])); ?>" />
+		<input type="hidden" name="toRow" value="<?php if ($isPromoting) echo (h($_POST['toRow'])); ?>" />
+		<input type="hidden" name="toCol" value="<?php if ($isPromoting) echo (h($_POST['toCol'])); ?>" />
 		<input type="hidden" name="isInCheck" value="false" />
 		<input type="hidden" name="isCheckMate" value="false" />
 		</form>
 		<div id="gamenav"></div>
-		<div><?echo gettext('When castling, just move the king (the rook will move automatically).');?></div>
-		<div id="captheading"><?echo gettext('Captured pieces'); ?></div>
+		<div><?php echo gettext('When castling, just move the king (the rook will move automatically).');?></div>
+		<div id="captheading"><?php echo gettext('Captured pieces'); ?></div>
 		<div id="captures"></div>
 	</div>
 
 	<div id="content">
+		<div id="appearance" style="text-align:center; padding:4px 0;">
+			<label><?php echo gettext("Board"); ?>:
+				<select id="boardColorSelect">
+					<option value="grey"><?php echo gettext("Grey"); ?></option>
+					<option value="brown"><?php echo gettext("Brown"); ?></option>
+					<option value="green"><?php echo gettext("Green"); ?></option>
+				</select>
+			</label>
+			<?php if ($notifyEnabled) { ?>
+			<div id="notify">
+				<label><input type="checkbox" id="notifyToggle" />
+				<?php echo gettext("Notify me when my opponent has moved"); ?></label>
+				<div id="notifyHint" style="font-size:smaller;"></div>
+			</div>
+			<?php } ?>
+		</div>
 		<div id="players" class="move_header"></div>
 		<div id="gameid" class="move_header"></div>
 		<div id="gamebody" class="move_header"></div>
 		<div id="checkmsg"></div>
 		<div id="statusmsg"></div>
 		<form name="gamemenu" method="post" action="chess.php" style="text-align:center;">
+		<?php echo csrf_field(); ?>
 		<input type="button" id="btnMainMenu" class="button" value="Menu" disabled="disabled" />
 		<input type="button" id="btnReload" class="button" value="Reload" disabled="disabled" />
 		<input type="button" id="btnPGN" class="button" value="PGN" disabled="disabled" />

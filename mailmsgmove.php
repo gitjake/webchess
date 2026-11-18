@@ -2,7 +2,7 @@
 	// $Id: mailmsgmove.php,v 1.5 2010/08/14 16:57:54 sandking Exp $
 
 /*
-    This file is part of WebChess. http://webchess.sourceforge.net
+    This file is part of WebChess. https://github.com/thorium/webchess
 	Copyright 2010 Jonathan Evraire, Rodrigo Flores
 
     WebChess is free software: you can redistribute it and/or modify
@@ -33,4 +33,4 @@
 	$termMsg = sprintf(gettext('This message has been automatically been sent by %s and should not be replied to'), APP_NAME);
 	$mailmsg .= "\n\n" . $termMsg . ".\n";
 	
-	$mailmsg .= sprintf(gettext('Go to: %s to play.'), $CFG_MAINPAGE) . "\n";
+	$mailmsg .= sprintf(gettext('Go to: %s to play.'), rtrim($CFG_MAINPAGE, '/') . "/mainmenu.php?game=" . (int)$gameID) . "\n";
